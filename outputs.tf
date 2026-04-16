@@ -53,8 +53,8 @@ output "reserved_public_ips" {
   value = {
     for key, eip in aws_eip.reserved_public_ips :
     key => {
-      id         = eip.id
-      public_ip  = eip.public_ip
+      id              = eip.id
+      public_ip       = eip.public_ip
       associated_with = aws_eip_association.reserved_ips[key].network_interface_id
     }
   }

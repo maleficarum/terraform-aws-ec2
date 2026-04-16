@@ -1,188 +1,172 @@
-# Local variables for processing
-locals {
-  
-  # Flatten VNICs for resource creation
-  flattened_vnics = flatten([
-    for idx, config in var.instance_configuration :
-    [
-      for vnic_idx, vnic in local.vnic_configs[idx] :
-      {
-        key           = "${idx}_${vnic_idx}"
-        instance_idx  = idx
-        vnic_idx      = vnic_idx
-        config        = config
-        vnic_config   = vnic
-      }
-    ]
-  ])
-  
-  # Flatten block volumes for resource creation
-  flattened_volumes = flatten([
-    for idx, config in var.instance_configuration :
-    [
-      for vol_idx, volume in config.block_volumes :
-      {
-        key           = "${idx}_${vol_idx}"
-        instance_idx  = idx
-        volume_idx    = vol_idx
-        volume_config = volume
-        config        = config
-      }
-    ]
-  ])
-  
-  # Flatten reserved public IPs
-  flattened_reserved_ips = flatten([
-    for idx, config in var.instance_configuration :
-    [
-      for vnic_idx, vnic in local.vnic_configs[idx] :
-      {
-        key           = "${idx}_${vnic_idx}"
-        instance_idx  = idx
-        vnic_idx      = vnic_idx
-        config        = config
-        vnic_config   = vnic
-      }
-      if config.reserved_public_ip == true && vnic.public == true
-    ]
-  ])
+resource "aws_iam_role" "ec2_role" {
+  name = "ec2-ssm-role"
 
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "ec2-ssm-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_security_group" "instance_sg" {
   for_each = {
     for idx, config in var.instance_configuration :
-    idx => config
+    tostring(idx) => config
   }
-  
-  name        = "${each.value.name}-sg"
-  description = "Security group for ${each.value.name}"
-  vpc_id      = var.networks.vpc_id
 
-  tags = {
-    created-by = var.author
-  }
-  
-  # SSH access
+  name   = "${each.value.name}-sg"
+  vpc_id = var.networks.vpc_id
+
   ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = var.allowed_ssh_cidrs
-    description = "SSH access"
   }
-  
-  # ICMP for ping (optional)
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_http_cidrs
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_http_cidrs
+  }
+
   ingress {
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "ICMP"
   }
-  
-  # Allow all outbound traffic
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  
 }
 
+# Create network interfaces first
 resource "aws_network_interface" "vnic" {
   for_each = {
     for vnic in local.flattened_vnics :
     vnic.key => vnic
   }
-  
-  subnet_id = each.value.vnic_config.type == "public" ? var.networks.public_subnet_ids[each.value.vnic_idx % length(var.networks.public_subnet_ids)] : var.networks.private_subnet_ids[each.value.instance_idx % length(var.networks.private_subnet_ids)]
-  
-  security_groups = [aws_security_group.instance_sg[each.value.instance_idx].id]
-  
-  # Source/destination check (set to false for NAT instances)
+
+  subnet_id = each.value.config.subnet_type == "public" ? local.get_subnet_id.public[tostring(each.value.instance_idx)] : local.get_subnet_id.private[tostring(each.value.instance_idx)]
+
+  security_groups = [
+    aws_security_group.instance_sg[tostring(each.value.instance_idx)].id
+  ]
+
   source_dest_check = true
-  
+
   lifecycle {
-    ignore_changes = [
-      attachment,  # Prevent conflicts with aws_instance network_interface attachment
-    ]
+    ignore_changes = [attachment]
   }
 
   tags = {
-    created-by = var.author
+    Name = "${each.value.config.name}-vnic${each.value.vnic_idx}"
   }
 }
 
-# EC2 Instances
+# Create instance in the appropriate subnet directly
 resource "aws_instance" "instances" {
   for_each = {
     for idx, config in var.instance_configuration :
-    idx => config
+    tostring(idx) => config
   }
 
-  tags = {
-    created-by = var.author
-  }
-  
-  ami               = each.value.image
-  instance_type     = each.value.shape_config.type
-  iam_instance_profile = var.iam_instance_profile
-  
-  # Root volume configuration
+  ami           = each.value.image
+  instance_type = each.value.shape
+
+  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+
+  subnet_id = each.value.subnet_type == "public" ? local.get_subnet_id.public[0] : local.get_subnet_id.private[0]
+
+  associate_public_ip_address = false
+
   root_block_device {
-    volume_size = each.value.storage_size != null ? each.value.storage_size : 20
+    volume_size = each.value.storage_size
     volume_type = "gp3"
     encrypted   = true
-    
   }
-  
-  # Primary network interface (device_index 0)
-  network_interface {
-    network_interface_id = aws_network_interface.vnic["${each.key}_0"].id
-    device_index         = 0
-  }
-  
-  # Secondary network interface (device_index 1) - if exists
-  dynamic "network_interface" {
-    for_each = length(local.vnic_configs[each.key]) > 1 ? [local.vnic_configs[each.key][1]] : []
-    content {
-      network_interface_id = aws_network_interface.vnic["${each.key}_1"].id
-      device_index         = network_interface.value.device_index
-    }
-  }
-  
-  # Tertiary network interface (device_index 2) - if exists
-  dynamic "network_interface" {
-    for_each = length(local.vnic_configs[each.key]) > 2 ? [local.vnic_configs[each.key][2]] : []
-    content {
-      network_interface_id = aws_network_interface.vnic["${each.key}_2"].id
-      device_index         = network_interface.value.device_index
-    }
-  }
-  
-  # User data for SSH key configuration
-user_data = base64encode(templatefile("${path.module}/cloud-init/cloud-init.yaml", {
-    instance_name    = each.value.name
-    ssh_public_keys  = each.value.ssh_public_key
-}))
 
-  # Credit specification for T-series instances
-  dynamic "credit_specification" {
-    for_each = startswith(each.value.shape_config.type, "t") ? [1] : []
-    content {
-      cpu_credits = "standard"
-    }
+  user_data_base64 = base64encode(templatefile("${path.module}/cloud-init/cloud-init-${each.value.name}.yaml", {
+    instance_name   = each.value.name
+    ssh_public_keys = each.value.ssh_public_key
+  }))
+
+  tags = {
+    Name       = each.value.name
+    created-by = var.author
   }
-  
+
   lifecycle {
-    ignore_changes  = [
-      ami,  # Allow AMI updates during maintenance
-      user_data,  # Ignore user_data changes after creation
-    ]
+    ignore_changes = [ami, user_data]
   }
+
+    vpc_security_group_ids = [
+    aws_security_group.instance_sg[each.key].id
+  ]
+
+  # 🚨 CRITICAL FIX: IAM eventual consistency
+  depends_on = [
+    aws_iam_role_policy_attachment.ssm
+  ]
 }
+
+
+# For primary interface with custom configuration (if needed)
+# Don't use custom ENI for primary, let AWS create it
+
+# Attach primary network interface
+# resource "aws_network_interface_attachment" "primary_vnic" {
+#   for_each = {
+#     for vnic in local.flattened_vnics :
+#     vnic.key => vnic
+#     if vnic.vnic_idx == 0
+#   }
+
+#   instance_id          = aws_instance.instances[each.value.instance_idx].id
+#   network_interface_id = aws_network_interface.vnic[each.key].id
+#   device_index         = 0
+# }
+
+resource "aws_network_interface_attachment" "secondary_vnics" {
+  for_each = {
+    for vnic in local.flattened_vnics :
+    vnic.key => vnic
+    if vnic.vnic_idx > 0
+  }
+
+  instance_id = aws_instance.instances[tostring(each.value.instance_idx)].id
+  network_interface_id = aws_network_interface.vnic[each.key].id
+  device_index = each.value.vnic_idx
+}
+
 
 # Elastic IPs for reserved public IPs
 resource "aws_eip" "reserved_public_ips" {
@@ -190,9 +174,8 @@ resource "aws_eip" "reserved_public_ips" {
     for ip in local.flattened_reserved_ips :
     ip.key => ip
   }
-  
+
   domain = "vpc"
-  
 }
 
 # Associate EIPs with network interfaces
@@ -200,24 +183,26 @@ resource "aws_eip_association" "reserved_ips" {
   for_each = {
     for ip in local.flattened_reserved_ips :
     ip.key => ip
+    if ip.vnic_idx == 0
   }
-  
-  network_interface_id = aws_network_interface.vnic[each.key].id
-  allocation_id        = aws_eip.reserved_public_ips[each.key].id
+
+  allocation_id = aws_eip.reserved_public_ips[each.key].id
+
+  # ✅ attach to PRIMARY ENI
+  network_interface_id = aws_instance.instances[tostring(each.value.instance_idx)].primary_network_interface_id
 }
 
-# EBS Block Volumes
+# EBS Block Volumes - Create after instances
 resource "aws_ebs_volume" "block_volumes" {
   for_each = {
     for vol in local.flattened_volumes :
     vol.key => vol
   }
-  
-  availability_zone = aws_instance.instances[each.value.instance_idx].availability_zone
+
+  availability_zone = aws_instance.instances[tostring(each.value.instance_idx)].availability_zone
   size              = each.value.volume_config.size
   type              = each.value.volume_config.type
   encrypted         = each.value.volume_config.encrypted
-  
 }
 
 # Attach block volumes to instances
@@ -226,14 +211,10 @@ resource "aws_volume_attachment" "block_attachments" {
     for vol in local.flattened_volumes :
     vol.key => vol
   }
-  
+
   device_name = "/dev/sd${substr("fghijklmnopqrstuvwxyz", each.value.volume_idx, 1)}"
   volume_id   = aws_ebs_volume.block_volumes[each.key].id
-  instance_id = aws_instance.instances[each.value.instance_idx].id
-  
-  # Prevent volume from being deleted when attachment is destroyed
+  instance_id = aws_instance.instances[tostring(each.value.instance_idx)].id
+
   skip_destroy = true
-  
-  # Stop instance before attaching volume (required for some instance types)
-  # stop_instance_before_detaching = true
 }
